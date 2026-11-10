@@ -1,0 +1,13 @@
+{
+  "name": "disparos-mentoria",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agendador de disparos de WhatsApp para mentoradas via Evolution API",
+  "main": "disparador.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}

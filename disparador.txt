@@ -1,0 +1,248 @@
+// Disparador de mensagens para mentoradas — roda a cada 5 min no Render (cron).
+// Lê as campanhas da variável CAMPANHAS (JSON), confere quais estão na hora,
+// pega as participantes dos grupos e manda no privado de cada uma.
+
+const { Client } = require('pg');
+
+const BASE = `http://${process.env.EVOLUTION_HOSTPORT}`;
+const KEY = process.env.EVOLUTION_API_KEY;
+const INST = process.env.INSTANCIA || 'mentoria';
+const JANELA_HORAS = 6; // campanha atrasada mais que isso não dispara mais
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const rand = (a, b) => Math.floor(a + Math.random() * (b - a + 1));
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+async function evo(method, path, body) {
+  const res = await fetch(BASE + path, {
+    method,
+    headers: { apikey: KEY, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(120000),
+  });
+  const txt = await res.text();
+  let data;
+  try { data = JSON.parse(txt); } catch { data = txt; }
+  if (!res.ok) throw new Error(`${method} ${path} -> ${res.status} ${txt.slice(0, 300)}`);
+  return data;
+}
+
+let db;
+async function q(sql, params) { return db.query(sql, params); }
+
+async function prepararBanco() {
+  await q(`CREATE TABLE IF NOT EXISTS disparo_estado (
+    chave text PRIMARY KEY, valor text, atualizado_em timestamptz DEFAULT now())`);
+  await q(`CREATE TABLE IF NOT EXISTS disparo_grupos (
+    jid text PRIMARY KEY, nome text, participantes int, atualizado_em timestamptz DEFAULT now())`);
+  await q(`CREATE TABLE IF NOT EXISTS disparo_campanhas (
+    id text PRIMARY KEY, status text, total int DEFAULT 0, enviados int DEFAULT 0, falhas int DEFAULT 0,
+    iniciado_em timestamptz, concluido_em timestamptz, obs text)`);
+  await q(`CREATE TABLE IF NOT EXISTS disparo_envios (
+    campanha_id text, destino text, nome text, status text, erro text,
+    enviado_em timestamptz DEFAULT now(), PRIMARY KEY (campanha_id, destino))`);
+}
+
+async function estado(chave, valor) {
+  await q(`INSERT INTO disparo_estado (chave, valor, atualizado_em) VALUES ($1,$2,now())
+           ON CONFLICT (chave) DO UPDATE SET valor=$2, atualizado_em=now()`, [chave, String(valor)]);
+}
+
+async function garantirInstancia() {
+  let lista = await evo('GET', `/instance/fetchInstances?instanceName=${INST}`).catch(() => []);
+  if (!Array.isArray(lista) || lista.length === 0) {
+    log('Criando instância', INST);
+    await evo('POST', '/instance/create', { instanceName: INST, integration: 'WHATSAPP-BAILEYS', qrcode: true });
+    lista = await evo('GET', `/instance/fetchInstances?instanceName=${INST}`).catch(() => []);
+  }
+  const inst = Array.isArray(lista) ? lista[0] : null;
+  const conn = await evo('GET', `/instance/connectionState/${INST}`).catch((e) => ({ erro: e.message }));
+  const state = conn?.instance?.state || conn?.state || 'desconhecido';
+  const dono = (inst?.ownerJid || '').split('@')[0];
+  await estado('conexao', state);
+  await estado('numero_conectado', dono || '-');
+  return { state, dono };
+}
+
+async function atualizarGrupos(forcar) {
+  const r = await q(`SELECT valor FROM disparo_estado WHERE chave='grupos_atualizados_em'`);
+  const ultima = r.rows[0] ? new Date(r.rows[0].valor) : new Date(0);
+  if (!forcar && Date.now() - ultima.getTime() < 30 * 60 * 1000) return null;
+  const grupos = await evo('GET', `/group/fetchAllGroups/${INST}?getParticipants=true`);
+  await q('DELETE FROM disparo_grupos');
+  for (const g of grupos) {
+    await q(`INSERT INTO disparo_grupos (jid, nome, participantes) VALUES ($1,$2,$3)
+             ON CONFLICT (jid) DO UPDATE SET nome=$2, participantes=$3, atualizado_em=now()`,
+      [g.id, g.subject || '', (g.participants || []).length]);
+  }
+  await estado('grupos_atualizados_em', new Date().toISOString());
+  log(`Grupos atualizados: ${grupos.length}`);
+  return grupos;
+}
+
+function destinoDe(p) {
+  for (const c of [p.phoneNumber, p.jid, p.id]) {
+    if (typeof c === 'string' && c.endsWith('@s.whatsapp.net')) return c.split('@')[0];
+  }
+  return p.id; // @lid — a Evolution resolve
+}
+
+function primeiroNome(n) {
+  if (!n) return '';
+  const limpo = String(n).replace(/[^\p{L}\s'-]/gu, ' ').trim().split(/\s+/)[0] || '';
+  if (limpo.length < 2) return '';
+  return limpo.charAt(0).toUpperCase() + limpo.slice(1).toLowerCase();
+}
+
+function personalizar(texto, nome) {
+  if (!texto) return texto;
+  if (nome) return texto.replace(/\{nome\}/g, nome);
+  const t = texto.replace(/[ \t]*\{nome\}/g, '').replace(/^\s*[,!]\s*/, '');
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+const MIME = {
+  pdf: 'application/pdf', doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  zip: 'application/zip', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', mp4: 'video/mp4',
+};
+
+async function enviarPasso(destino, passo, nome) {
+  const legenda = personalizar(passo.legenda || '', nome);
+  switch (passo.tipo) {
+    case 'texto':
+      return evo('POST', `/message/sendText/${INST}`, {
+        number: destino, text: personalizar(passo.texto, nome), delay: rand(1500, 3500) });
+    case 'audio':
+      return evo('POST', `/message/sendWhatsAppAudio/${INST}`, {
+        number: destino, audio: passo.url, delay: rand(2500, 5000) });
+    case 'documento': {
+      const arq = passo.arquivo || 'material.pdf';
+      const ext = arq.split('.').pop().toLowerCase();
+      return evo('POST', `/message/sendMedia/${INST}`, {
+        number: destino, mediatype: 'document', mimetype: MIME[ext] || 'application/octet-stream',
+        media: passo.url, fileName: arq, caption: legenda, delay: 1200 });
+    }
+    case 'imagem':
+    case 'video':
+      return evo('POST', `/message/sendMedia/${INST}`, {
+        number: destino, mediatype: passo.tipo === 'imagem' ? 'image' : 'video',
+        media: passo.url, caption: legenda, delay: 1200 });
+    default:
+      throw new Error(`tipo de passo desconhecido: ${passo.tipo}`);
+  }
+}
+
+async function montarDestinatarios(camp, grupos, dono) {
+  if (Array.isArray(camp.somente) && camp.somente.length) {
+    return camp.somente.map((n) => ({ destino: String(n).replace(/\D/g, ''), nome: camp.nomeTeste || '' }));
+  }
+  const excluir = new Set([dono, ...String(process.env.EXCLUIR_NUMEROS || '').split(',')]
+    .map((n) => String(n).replace(/\D/g, '')).filter(Boolean));
+  const alvo = (camp.grupos || []).map((g) => String(g).toLowerCase().trim());
+  const escolhidos = grupos.filter((g) =>
+    alvo.some((a) => g.id.toLowerCase() === a || (g.subject || '').toLowerCase().includes(a)));
+  if (escolhidos.length === 0) throw new Error(`nenhum grupo encontrado para: ${alvo.join(' | ')}`);
+
+  let contatos = [];
+  try { contatos = await evo('POST', `/chat/findContacts/${INST}`, { where: {} }); } catch { contatos = []; }
+  const nomes = new Map();
+  for (const c of contatos || []) if (c.remoteJid && c.pushName) nomes.set(c.remoteJid.split('@')[0], c.pushName);
+
+  const mapa = new Map();
+  for (const g of escolhidos) {
+    for (const p of g.participants || []) {
+      if (!camp.incluirAdmins && p.admin) continue;
+      const destino = destinoDe(p);
+      const chave = String(destino).split('@')[0];
+      if (excluir.has(chave)) continue;
+      if (!mapa.has(chave)) mapa.set(chave, { destino, nome: primeiroNome(nomes.get(chave) || p.name || p.pushName) });
+    }
+  }
+  return [...mapa.values()];
+}
+
+async function rodarCampanha(camp, grupos, dono) {
+  const lista = await montarDestinatarios(camp, grupos, dono);
+  await q(`INSERT INTO disparo_campanhas (id, status, total, iniciado_em) VALUES ($1,'em_andamento',$2,now())
+           ON CONFLICT (id) DO UPDATE SET status='em_andamento', total=$2`, [camp.id, lista.length]);
+  log(`Campanha ${camp.id}: ${lista.length} destinatárias`);
+  const [iMin, iMax] = Array.isArray(camp.intervalo) ? camp.intervalo : [20, 60];
+
+  for (const pessoa of lista) {
+    const ja = await q(`SELECT 1 FROM disparo_envios WHERE campanha_id=$1 AND destino=$2 AND status='ok'`,
+      [camp.id, pessoa.destino]);
+    if (ja.rowCount) continue;
+    try {
+      for (let i = 0; i < camp.passos.length; i++) {
+        await enviarPasso(pessoa.destino, camp.passos[i], pessoa.nome);
+        if (i < camp.passos.length - 1) await sleep(rand(3000, 8000));
+      }
+      await q(`INSERT INTO disparo_envios (campanha_id, destino, nome, status) VALUES ($1,$2,$3,'ok')
+               ON CONFLICT (campanha_id, destino) DO UPDATE SET status='ok', erro=null, enviado_em=now()`,
+        [camp.id, pessoa.destino, pessoa.nome]);
+      log(`ok -> ${pessoa.destino}`);
+    } catch (e) {
+      await q(`INSERT INTO disparo_envios (campanha_id, destino, nome, status, erro) VALUES ($1,$2,$3,'falha',$4)
+               ON CONFLICT (campanha_id, destino) DO UPDATE SET status='falha', erro=$4, enviado_em=now()`,
+        [camp.id, pessoa.destino, pessoa.nome, e.message.slice(0, 500)]);
+      log(`falha -> ${pessoa.destino}: ${e.message}`);
+    }
+    await sleep(rand(iMin, iMax) * 1000);
+  }
+
+  const r = await q(`SELECT count(*) FILTER (WHERE status='ok') ok, count(*) FILTER (WHERE status='falha') f
+                     FROM disparo_envios WHERE campanha_id=$1`, [camp.id]);
+  await q(`UPDATE disparo_campanhas SET status='concluida', enviados=$2, falhas=$3, concluido_em=now() WHERE id=$1`,
+    [camp.id, Number(r.rows[0].ok), Number(r.rows[0].f)]);
+  log(`Campanha ${camp.id} concluída: ${r.rows[0].ok} ok, ${r.rows[0].f} falhas`);
+}
+
+async function main() {
+  db = new Client({ connectionString: process.env.DATABASE_URL });
+  await db.connect();
+  await prepararBanco();
+
+  const { state, dono } = await garantirInstancia();
+  log('Conexão WhatsApp:', state);
+  if (state !== 'open') return;
+
+  let campanhas = [];
+  try { campanhas = JSON.parse(process.env.CAMPANHAS || '[]'); }
+  catch (e) { log('CAMPANHAS inválido:', e.message); await estado('erro_campanhas', e.message); }
+
+  const agora = Date.now();
+  const devidas = [];
+  for (const c of campanhas) {
+    if (c.pausado) continue;
+    const t = new Date(c.quando).getTime();
+    if (isNaN(t) || agora < t) continue;
+    const r = await q(`SELECT status FROM disparo_campanhas WHERE id=$1`, [c.id]);
+    const st = r.rows[0]?.status;
+    if (st === 'concluida' || st === 'expirada') continue;
+    if (agora - t > JANELA_HORAS * 3600 * 1000 && st !== 'em_andamento') {
+      await q(`INSERT INTO disparo_campanhas (id, status, obs) VALUES ($1,'expirada','passou da janela de ${JANELA_HORAS}h')
+               ON CONFLICT (id) DO UPDATE SET status='expirada', obs=coalesce(disparo_campanhas.obs,'') || ' | expirada'`, [c.id]);
+      continue;
+    }
+    devidas.push(c);
+  }
+
+  const grupos = (await atualizarGrupos(devidas.some((c) => !c.somente))) || null;
+  for (const c of devidas.sort((a, b) => new Date(a.quando) - new Date(b.quando))) {
+    try {
+      const g = grupos || (c.somente ? [] : await evo('GET', `/group/fetchAllGroups/${INST}?getParticipants=true`));
+      await rodarCampanha(c, g, dono);
+    } catch (e) {
+      log(`Erro na campanha ${c.id}:`, e.message);
+      await q(`INSERT INTO disparo_campanhas (id, status, obs) VALUES ($1,'erro',$2)
+               ON CONFLICT (id) DO UPDATE SET status='erro', obs=$2`, [c.id, e.message.slice(0, 500)]);
+    }
+  }
+}
+
+main()
+  .catch((e) => { log('ERRO GERAL:', e.message); process.exitCode = 1; })
+  .finally(() => db && db.end());

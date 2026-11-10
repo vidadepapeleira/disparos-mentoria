@@ -1,0 +1,98 @@
+databases:
+  - name: evolution-db
+    plan: basic-256mb
+    region: virginia
+    postgresMajorVersion: "16"
+    diskSizeGB: 1
+
+services:
+  # WhatsApp (Evolution API)
+  - type: web
+    name: evolution-api
+    runtime: image
+    image:
+      url: docker.io/evoapicloud/evolution-api:v2.3.7
+    plan: starter
+    region: virginia
+    envVars:
+      - key: AUTHENTICATION_API_KEY
+        sync: false
+      - key: DATABASE_CONNECTION_URI
+        fromDatabase:
+          name: evolution-db
+          property: connectionString
+      - key: PORT
+        value: "8080"
+      - key: SERVER_PORT
+        value: "8080"
+      - key: SERVER_TYPE
+        value: http
+      - key: DATABASE_ENABLED
+        value: "true"
+      - key: DATABASE_PROVIDER
+        value: postgresql
+      - key: DATABASE_CONNECTION_CLIENT_NAME
+        value: evolution
+      - key: DATABASE_SAVE_DATA_INSTANCE
+        value: "true"
+      - key: DATABASE_SAVE_DATA_NEW_MESSAGE
+        value: "false"
+      - key: DATABASE_SAVE_MESSAGE_UPDATE
+        value: "false"
+      - key: DATABASE_SAVE_DATA_CONTACTS
+        value: "true"
+      - key: DATABASE_SAVE_DATA_CHATS
+        value: "false"
+      - key: DATABASE_SAVE_DATA_LABELS
+        value: "false"
+      - key: DATABASE_SAVE_DATA_HISTORIC
+        value: "false"
+      - key: CACHE_REDIS_ENABLED
+        value: "false"
+      - key: CACHE_LOCAL_ENABLED
+        value: "true"
+      - key: DEL_INSTANCE
+        value: "false"
+      - key: LANGUAGE
+        value: pt-BR
+      - key: CONFIG_SESSION_PHONE_CLIENT
+        value: Mentoria
+      - key: CONFIG_SESSION_PHONE_NAME
+        value: Chrome
+      - key: QRCODE_LIMIT
+        value: "30"
+      - key: LOG_LEVEL
+        value: ERROR,WARN,INFO
+      - key: TELEMETRY_ENABLED
+        value: "false"
+
+  # Agendador de disparos (roda a cada 5 minutos)
+  - type: cron
+    name: disparador
+    runtime: node
+    plan: starter
+    region: virginia
+    schedule: "*/5 * * * *"
+    buildCommand: npm install --omit=dev
+    startCommand: node disparador.txt
+    envVars:
+      - key: EVOLUTION_HOSTPORT
+        fromService:
+          type: web
+          name: evolution-api
+          property: hostport
+      - key: EVOLUTION_API_KEY
+        fromService:
+          type: web
+          name: evolution-api
+          envVarKey: AUTHENTICATION_API_KEY
+      - key: DATABASE_URL
+        fromDatabase:
+          name: evolution-db
+          property: connectionString
+      - key: INSTANCIA
+        value: mentoria
+      - key: CAMPANHAS
+        sync: false
+      - key: EXCLUIR_NUMEROS
+        sync: false
