@@ -210,6 +210,30 @@ async function rodarCampanha(camp, grupos, dono) {
   log(`Campanha ${camp.id} concluída: ${r.rows[0].ok} ok, ${r.rows[0].f} falhas`);
 }
 
+// Sai dos grupos listados em SAIR_GRUPOS (JSON com os IDs), no máximo 8 por rodada, com pausa entre cada um
+async function sairDeGrupos() {
+  let lista = [];
+  try { lista = JSON.parse(process.env.SAIR_GRUPOS || '[]'); } catch (e) { log('SAIR_GRUPOS inválido:', e.message); return; }
+  if (!lista.length) return;
+  await q(`CREATE TABLE IF NOT EXISTS disparo_saidas (jid text PRIMARY KEY, status text, erro text, em timestamptz DEFAULT now())`);
+  const feitos = new Set((await q(`SELECT jid FROM disparo_saidas WHERE status='ok'`)).rows.map((r) => r.jid));
+  const pendentes = lista.filter((j) => !feitos.has(j));
+  log(`Saída de grupos: ${feitos.size} feitos, ${pendentes.length} pendentes`);
+  for (const jid of pendentes.slice(0, 8)) {
+    try {
+      await evo('DELETE', `/group/leaveGroup/${INST}?groupJid=${encodeURIComponent(jid)}`);
+      await q(`INSERT INTO disparo_saidas (jid, status) VALUES ($1,'ok') ON CONFLICT (jid) DO UPDATE SET status='ok', erro=null, em=now()`, [jid]);
+      log(`SAIU | ${jid}`);
+    } catch (e) {
+      const naoEsta = /not.*(part|member)|item-not-found|404|forbidden/i.test(e.message);
+      await q(`INSERT INTO disparo_saidas (jid, status, erro) VALUES ($1,$2,$3) ON CONFLICT (jid) DO UPDATE SET status=$2, erro=$3, em=now()`,
+        [jid, naoEsta ? 'ok' : 'falha', e.message.slice(0, 300)]);
+      log(`FALHA SAIR | ${jid} | ${e.message}`);
+    }
+    await sleep(rand(20, 35) * 1000);
+  }
+}
+
 async function main() {
   db = new Client({ connectionString: process.env.DATABASE_URL });
   await db.connect();
@@ -218,6 +242,8 @@ async function main() {
   const { state, dono } = await garantirInstancia();
   log('Conexão WhatsApp:', state);
   if (state !== 'open') return;
+
+  try { await sairDeGrupos(); } catch (e) { log('Erro na saída de grupos:', e.message); }
 
   let campanhas = [];
   try { campanhas = JSON.parse(process.env.CAMPANHAS || '[]'); }
