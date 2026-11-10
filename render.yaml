@@ -56,7 +56,7 @@ services:
       - key: LANGUAGE
         value: pt-BR
       - key: CONFIG_SESSION_PHONE_CLIENT
-        value: Mentoria
+        value: Windows
       - key: CONFIG_SESSION_PHONE_NAME
         value: Chrome
       - key: QRCODE_LIMIT

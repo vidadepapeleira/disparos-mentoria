@@ -65,19 +65,26 @@ async function garantirInstancia() {
 }
 
 async function atualizarGrupos(forcar) {
-  const r = await q(`SELECT valor FROM disparo_estado WHERE chave='grupos_atualizados_em'`);
+  const r = await q(`SELECT valor FROM disparo_estado WHERE chave='grupos_lista_em'`);
   const ultima = r.rows[0] ? new Date(r.rows[0].valor) : new Date(0);
-  if (!forcar && Date.now() - ultima.getTime() < 30 * 60 * 1000) return null;
-  const grupos = await evo('GET', `/group/fetchAllGroups/${INST}?getParticipants=true`);
+  if (!forcar && Date.now() - ultima.getTime() < 12 * 3600 * 1000) return null;
+  // Uma única consulta leve (sem participantes) para não estourar limite do WhatsApp
+  const grupos = await evo('GET', `/group/fetchAllGroups/${INST}?getParticipants=false`);
   await q('DELETE FROM disparo_grupos');
   for (const g of grupos) {
     await q(`INSERT INTO disparo_grupos (jid, nome, participantes) VALUES ($1,$2,$3)
              ON CONFLICT (jid) DO UPDATE SET nome=$2, participantes=$3, atualizado_em=now()`,
-      [g.id, g.subject || '', (g.participants || []).length]);
+      [g.id, g.subject || '', g.size || null]);
   }
-  await estado('grupos_atualizados_em', new Date().toISOString());
+  await estado('grupos_lista_em', new Date().toISOString());
   log(`Grupos atualizados: ${grupos.length}`);
+  for (const g of grupos) log(`GRUPO | ${g.subject || '(sem nome)'} | ${g.size ?? '?'} pessoas | ${g.id}`);
   return grupos;
+}
+
+async function participantesDe(jid) {
+  const r = await evo('GET', `/group/participants/${INST}?groupJid=${encodeURIComponent(jid)}`);
+  return Array.isArray(r) ? r : r?.participants || [];
 }
 
 function destinoDe(p) {
@@ -151,9 +158,12 @@ async function montarDestinatarios(camp, grupos, dono) {
   const nomes = new Map();
   for (const c of contatos || []) if (c.remoteJid && c.pushName) nomes.set(c.remoteJid.split('@')[0], c.pushName);
 
+  log(`Grupos da campanha: ${escolhidos.map((g) => g.subject).join(' | ')}`);
   const mapa = new Map();
   for (const g of escolhidos) {
-    for (const p of g.participants || []) {
+    const participantes = await participantesDe(g.id);
+    await sleep(2000);
+    for (const p of participantes) {
       if (!camp.incluirAdmins && p.admin) continue;
       const destino = destinoDe(p);
       const chave = String(destino).split('@')[0];
@@ -230,11 +240,11 @@ async function main() {
     devidas.push(c);
   }
 
-  const grupos = (await atualizarGrupos(devidas.some((c) => !c.somente))) || null;
+  let grupos = await atualizarGrupos(false);
   for (const c of devidas.sort((a, b) => new Date(a.quando) - new Date(b.quando))) {
     try {
-      const g = grupos || (c.somente ? [] : await evo('GET', `/group/fetchAllGroups/${INST}?getParticipants=true`));
-      await rodarCampanha(c, g, dono);
+      if (!c.somente && !grupos) grupos = await evo('GET', `/group/fetchAllGroups/${INST}?getParticipants=false`);
+      await rodarCampanha(c, c.somente ? [] : grupos, dono);
     } catch (e) {
       log(`Erro na campanha ${c.id}:`, e.message);
       await q(`INSERT INTO disparo_campanhas (id, status, obs) VALUES ($1,'erro',$2)
